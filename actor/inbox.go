@@ -1,10 +1,8 @@
 package actor
 
 import (
-	"runtime"
+	"context"
 	"sync/atomic"
-
-	"github.com/anthdm/hollywood/ringbuffer"
 )
 
 const (
@@ -39,73 +37,44 @@ func NewScheduler(throughput int) Scheduler {
 }
 
 type Inboxer interface {
-	Send(Envelope)
 	Start(Processer)
-	Stop() error
+	Send(Envelope)
+	Stop()
 }
 
-type Inbox struct {
-	rb         *ringbuffer.RingBuffer[Envelope]
+type inbox struct {
+	ch         chan Envelope
 	proc       Processer
-	scheduler  Scheduler
 	procStatus int32
+	size       int
 }
 
-func NewInbox(size int) *Inbox {
-	return &Inbox{
-		rb:         ringbuffer.New[Envelope](int64(size)),
-		scheduler:  NewScheduler(defaultThroughput),
+func (i *inbox) Start(p Processer) {
+	i.proc = p
+	go i.processMessages()
+}
+
+func (i *inbox) Stop() {
+	if atomic.CompareAndSwapInt32(&i.procStatus, running, stopped) {
+		close(i.ch)
+		i.proc.Shutdown(context.Background(), func() {})
+	}
+}
+
+func NewInbox(size int) *inbox {
+	return &inbox{
+		ch:         make(chan Envelope, size),
 		procStatus: stopped,
+		size:       size,
 	}
 }
 
-func (in *Inbox) Send(msg Envelope) {
-	in.rb.Push(msg)
-	in.schedule()
+func (i *inbox) Send(msg Envelope) {
+	i.ch <- msg
 }
 
-func (in *Inbox) schedule() {
-	if atomic.CompareAndSwapInt32(&in.procStatus, idle, running) {
-		in.scheduler.Schedule(in.process)
+func (i *inbox) processMessages() {
+	for msg := range i.ch {
+		i.proc.Invoke([]Envelope{msg})
 	}
-}
-
-func (in *Inbox) process() {
-	in.run()
-	if atomic.CompareAndSwapInt32(&in.procStatus, running, idle) && in.rb.Len() > 0 {
-		// messages might have been added to the ring-buffer between the last pop and the transition to idle.
-		// if this is the case, then we should schedule again
-		in.schedule()
-	}
-}
-
-func (in *Inbox) run() {
-	i, t := 0, in.scheduler.Throughput()
-	for atomic.LoadInt32(&in.procStatus) != stopped {
-		if i > t {
-			i = 0
-			runtime.Gosched()
-		}
-		i++
-
-		if msgs, ok := in.rb.PopN(messageBatchSize); ok && len(msgs) > 0 {
-			in.proc.Invoke(msgs)
-		} else {
-			return
-		}
-	}
-}
-
-func (in *Inbox) Start(proc Processer) {
-	// transition to "starting" and then "idle" to ensure no race condition on in.proc
-	if atomic.CompareAndSwapInt32(&in.procStatus, stopped, starting) {
-		in.proc = proc
-		atomic.SwapInt32(&in.procStatus, idle)
-		in.schedule()
-	}
-}
-
-func (in *Inbox) Stop() error {
-	atomic.StoreInt32(&in.procStatus, stopped)
-	return nil
 }

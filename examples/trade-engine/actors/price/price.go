@@ -1,6 +1,7 @@
 package price
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
@@ -89,8 +90,13 @@ func (pw *priceWatcherActor) Kill() {
 	// stop the repeater
 	pw.repeater.Stop()
 
-	// poision itself
-	pw.ActorEngine.Poison(pw.PID)
+	// Create a context with timeout for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// poison itself with context
+	poisonCtx := pw.ActorEngine.Poison(pw.PID, ctx)
+	<-poisonCtx.Done()
 }
 
 func NewPriceActor(opts types.PriceOptions) actor.Producer {

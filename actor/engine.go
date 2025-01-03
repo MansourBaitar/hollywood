@@ -1,6 +1,7 @@
 package actor
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -206,28 +207,35 @@ func (e *Engine) SendRepeat(pid *PID, msg any, interval time.Duration) SendRepea
 
 // Stop will send a non-graceful poisonPill message to the process that is associated with the given PID.
 // The process will shut down immediately, once it has processed the poisonPill messsage.
-func (e *Engine) Stop(pid *PID, wg ...*sync.WaitGroup) *sync.WaitGroup {
-	return e.sendPoisonPill(pid, false, wg...)
+func (e *Engine) Stop(pid *PID, ctx ...context.Context) context.Context {
+	return e.sendPoisonPill(pid, false, ctx...)
 }
 
 // Poison will send a graceful poisonPill message to the process that is associated with the given PID.
 // The process will shut down gracefully once it has processed all the messages in the inbox.
-// If given a WaitGroup, it blocks till the process is completely shutdown.
-func (e *Engine) Poison(pid *PID, wg ...*sync.WaitGroup) *sync.WaitGroup {
-	return e.sendPoisonPill(pid, true, wg...)
+// If given a context, it can be used to cancel or timeout the shutdown process.
+func (e *Engine) Poison(pid *PID, ctx ...context.Context) context.Context {
+	return e.sendPoisonPill(pid, true, ctx...)
 }
 
-func (e *Engine) sendPoisonPill(pid *PID, graceful bool, wg ...*sync.WaitGroup) *sync.WaitGroup {
-	var _wg *sync.WaitGroup
-	if len(wg) > 0 {
-		_wg = wg[0]
+func (e *Engine) sendPoisonPill(pid *PID, graceful bool, ctx ...context.Context) context.Context {
+	var pillCtx context.Context
+	var cancel context.CancelFunc
+
+	if len(ctx) > 0 && ctx[0] != nil {
+		// Create a child context that we can cancel when done
+		pillCtx, cancel = context.WithCancel(ctx[0])
 	} else {
-		_wg = &sync.WaitGroup{}
+		// If no context provided, create a new background context
+		pillCtx, cancel = context.WithCancel(context.Background())
 	}
+
 	pill := poisonPill{
-		wg:       _wg,
+		ctx:      pillCtx,
+		cancel:   cancel,
 		graceful: graceful,
 	}
+
 	// deadletter - if we didn't find a process, we will broadcast a DeadletterEvent
 	if e.Registry.get(pid) == nil {
 		e.BroadcastEvent(DeadLetterEvent{
@@ -235,11 +243,13 @@ func (e *Engine) sendPoisonPill(pid *PID, graceful bool, wg ...*sync.WaitGroup) 
 			Message: pill,
 			Sender:  nil,
 		})
-		return _wg
+		// Cancel immediately since there's no process
+		cancel()
+		return pillCtx
 	}
-	_wg.Add(1)
+
 	e.SendLocal(pid, pill, nil)
-	return _wg
+	return pillCtx
 }
 
 // SendLocal will send the given message to the given PID. If the recipient is not found in the

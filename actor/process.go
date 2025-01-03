@@ -2,10 +2,10 @@ package actor
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"sync"
 	"time"
 
 	"github.com/DataDog/gostackparse"
@@ -22,7 +22,7 @@ type Processer interface {
 	PID() *PID
 	Send(*PID, any, *PID)
 	Invoke([]Envelope)
-	Shutdown(*sync.WaitGroup)
+	Shutdown(context.Context, context.CancelFunc)
 }
 
 type process struct {
@@ -56,47 +56,33 @@ func applyMiddleware(rcv ReceiveFunc, middleware ...MiddlewareFunc) ReceiveFunc 
 }
 
 func (p *process) Invoke(msgs []Envelope) {
-	var (
-		// numbers of msgs that need to be processed.
-		nmsg = len(msgs)
-		// numbers of msgs that are processed.
-		nproc = 0
-		// FIXME: We could use nrpoc here, but for some reason placing nproc++ on the
-		// bottom of the function it freezes some tests. Hence, I created a new counter
-		// for bookkeeping.
-		processed = 0
-	)
-	defer func() {
-		// If we recovered, we buffer up all the messages that we could not process
-		// so we can retry them on the next restart.
-		if v := recover(); v != nil {
-			p.context.message = Stopped{}
-			p.context.receiver.Receive(p.context)
+	if len(msgs) == 0 {
+		return
+	}
 
-			p.mbuffer = make([]Envelope, nmsg-nproc)
-			for i := 0; i < nmsg-nproc; i++ {
-				p.mbuffer[i] = msgs[i+nproc]
-			}
-			p.tryRestart(v)
+	for _, msg := range msgs {
+		if msg.Msg == nil {
+			continue
 		}
-	}()
-	for i := 0; i < len(msgs); i++ {
-		nproc++
-		msg := msgs[i]
-		if pill, ok := msg.Msg.(poisonPill); ok {
-			// If we need to gracefuly stop, we process all the messages
-			// from the inbox, otherwise we ignore and cleanup.
+
+		switch pill := msg.Msg.(type) {
+		case poisonPill:
 			if pill.graceful {
-				msgsToProcess := msgs[processed:]
-				for _, m := range msgsToProcess {
-					p.invokeMsg(m)
-				}
+				p.mbuffer = append(p.mbuffer, msg)
+				continue
 			}
-			p.cleanup(pill.wg)
+			p.cleanup(pill.ctx, pill.cancel)
 			return
+		default:
+			p.invokeMsg(msg)
 		}
-		p.invokeMsg(msg)
-		processed++
+	}
+
+	// process buffered messages
+	if len(p.mbuffer) > 0 {
+		pill := p.mbuffer[0].Msg.(poisonPill)
+		p.cleanup(pill.ctx, pill.cancel)
+		return
 	}
 }
 
@@ -142,6 +128,11 @@ func (p *process) Start() {
 }
 
 func (p *process) tryRestart(v any) {
+	if p.MaxRestarts == 0 {
+		p.cleanup(context.Background(), func() {})
+		return
+	}
+
 	// InternalError does not take the maximum restarts into account.
 	// For now, InternalError is getting triggered when we are dialing
 	// a remote node. By doing this, we can keep dialing until it comes
@@ -161,7 +152,7 @@ func (p *process) tryRestart(v any) {
 			PID:       p.pid,
 			Timestamp: time.Now(),
 		})
-		p.cleanup(nil)
+		p.cleanup(nil, nil)
 		return
 	}
 
@@ -178,7 +169,7 @@ func (p *process) tryRestart(v any) {
 	p.Start()
 }
 
-func (p *process) cleanup(wg *sync.WaitGroup) {
+func (p *process) cleanup(ctx context.Context, cancel context.CancelFunc) {
 	if p.context.parentCtx != nil {
 		p.context.parentCtx.children.Delete(p.pid.ID)
 	}
@@ -186,7 +177,10 @@ func (p *process) cleanup(wg *sync.WaitGroup) {
 	if p.context.children.Len() > 0 {
 		children := p.context.Children()
 		for _, pid := range children {
-			p.context.engine.Poison(pid).Wait()
+			// Create a child context for each child process
+			childCtx := p.context.engine.Poison(pid)
+			// Wait for child context to be done
+			<-childCtx.Done()
 		}
 	}
 
@@ -196,8 +190,10 @@ func (p *process) cleanup(wg *sync.WaitGroup) {
 	applyMiddleware(p.context.receiver.Receive, p.Opts.Middleware...)(p.context)
 
 	p.context.engine.BroadcastEvent(ActorStoppedEvent{PID: p.pid, Timestamp: time.Now()})
-	if wg != nil {
-		wg.Done()
+
+	// Signal completion by canceling the context
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -205,7 +201,7 @@ func (p *process) PID() *PID { return p.pid }
 func (p *process) Send(_ *PID, msg any, sender *PID) {
 	p.inbox.Send(Envelope{Msg: msg, Sender: sender})
 }
-func (p *process) Shutdown(wg *sync.WaitGroup) { p.cleanup(wg) }
+func (p *process) Shutdown(ctx context.Context, cancel context.CancelFunc) { p.cleanup(ctx, cancel) }
 
 func cleanTrace(stack []byte) []byte {
 	goros, err := gostackparse.Parse(bytes.NewReader(stack))
