@@ -1,13 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -152,8 +152,11 @@ func main() {
 	signal.Notify(sigch, syscall.SIGINT, syscall.SIGTERM)
 	<-sigch
 
-	// wait till the server is gracefully shutdown by using a WaitGroup in the Poison call.
-	wg := &sync.WaitGroup{}
-	e.Poison(serverPID, wg)
-	wg.Wait()
+	// Create a context with timeout for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Wait for the server to gracefully shutdown using context
+	poisonCtx := e.Poison(serverPID, ctx)
+	<-poisonCtx.Done()
 }

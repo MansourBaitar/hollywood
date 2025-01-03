@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -69,6 +70,12 @@ func main() {
 	pid := e.Spawn(newFooReceiver, "foo")
 	e.Send(pid, message{data: fmt.Sprintf("msg_%d", 1)})
 	time.Sleep(time.Second * 8)
-	e.Poison(pid)
-	time.Sleep(time.Second)
+
+	// Create a context with timeout for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Wait for the process to gracefully shutdown
+	poisonCtx := e.Poison(pid, ctx)
+	<-poisonCtx.Done()
 }
